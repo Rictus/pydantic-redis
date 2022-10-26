@@ -6,6 +6,9 @@ from redis.client import Pipeline
 
 from pydantic_redis.abstract import _AbstractModel
 
+NESTED_MODEL_FIELD_PREFIX = "__"
+LIST_NESTED_MODEL_FIELD_PREFIX = "___"
+
 
 class Model(_AbstractModel):
     """
@@ -125,19 +128,58 @@ class Model(_AbstractModel):
         parsed_data = [cls.deserialize_partially(record) for record in data if record != {}]
         if len(parsed_data) > 0:
             field_types = typing.get_type_hints(cls)
-            nested_model_map: Dict[str, typing.Type[Model]] = {
-                k: field_types.get(k.lstrip("__"))
-                for k in parsed_data[0].keys() if k.startswith("__")
-            }
+            keys = [*parsed_data[0].keys()]
 
-            for key, model in nested_model_map.items():
-                field = key.lstrip("__")
-                ids = [record.pop(key, None) for record in parsed_data]
-                # a bulk network request might be faster than eagerly loading for each record for many records
-                nested_models = model.select(ids=ids)
-                parsed_data = [{**record, field: model} for record, model in zip(parsed_data, nested_models)]
+            for k in keys:
+                if k.startswith(LIST_NESTED_MODEL_FIELD_PREFIX):
+                    cls.__eager_load_nested_model_lists(prefixed_field=k, data=parsed_data,
+                                                        field_types=field_types)
+
+                elif k.startswith(NESTED_MODEL_FIELD_PREFIX):
+                    cls.__eager_load_nested_models(prefixed_field=k, data=parsed_data,
+                                                   field_types=field_types)
 
         return parsed_data
+
+    @classmethod
+    def __eager_load_nested_model_lists(cls, prefixed_field: str, data: List[Dict[str, Any]],
+                                        field_types: Dict[str, Any]):
+        """
+        Eagerly loads any properties that have `List[Model]` as their type annotations
+        for each item in the data such that primary_key lists are replaced by Model lists
+
+        Note: This mutates the data in-place as a way of optimization
+
+        For example:
+        [{"___books": ["id1", "id2"]}] becomes [{"books": [Book{"id": "id1", ...}, Book{"id": "id2", ...}]}]
+        """
+        field = prefixed_field.lstrip(LIST_NESTED_MODEL_FIELD_PREFIX)
+        model_type = field_types.get(field).__args__[0]
+
+        for record in data:
+            ids = record.pop(prefixed_field, None)
+            record[field] = model_type.select(ids=ids)
+
+    @classmethod
+    def __eager_load_nested_models(cls, prefixed_field: str, data: List[Dict[str, Any]], field_types: Dict[str, Any]):
+        """
+        Eagerly loads any properties that have `Model` as their type annotations
+        for each item in the data such that primary_key lists are replaced by Models
+
+        Note: This mutates the data in-place as a way of optimization
+
+        For example:
+        [{"__book": "id1"}] becomes [{"book": Book{"id": "id1", ...}}]
+        """
+        field = prefixed_field.lstrip(NESTED_MODEL_FIELD_PREFIX)
+        model_type = field_types.get(field)
+
+        ids: List[str] = [record.pop(prefixed_field, None) for record in data]
+        # a bulk network request might be faster than eagerly loading for each record for many records
+        nested_models = model_type.select(ids=ids)
+
+        for record, model in zip(data, nested_models):
+            record[field] = model
 
     @classmethod
     def __parse_hmget_response(cls, data: List[List[Any]], columns: List[str]) -> List[Dict[str, Any]]:
@@ -191,6 +233,31 @@ class Model(_AbstractModel):
         return key
 
     @classmethod
+    def __get_select_fields(cls, columns: Optional[List[str]]) -> Optional[List[str]]:
+        """
+        Gets the fields to be used for selecting HMAP fields in Redis
+        It replaces any fields in `columns` that correspond to nested records with their
+        `__` suffixed versions
+        """
+        if columns is None:
+            return None
+
+        field_types = typing.get_type_hints(cls)
+
+        fields = []
+        for col in columns:
+            field_type = field_types.get(col, None)
+
+            if isinstance(field_type, type(Model)):
+                fields.append(f"{NESTED_MODEL_FIELD_PREFIX}{col}")
+            elif issubclass(field_type, List) and isinstance(field_type.__args__[0], type(Model)):
+                fields.append(f"{LIST_NESTED_MODEL_FIELD_PREFIX}{col}")
+            else:
+                fields.append(col)
+
+        return fields
+
+    @classmethod
     def __get_serializable_dict(cls,
                                 pipeline: Pipeline,
                                 record: Union[_AbstractModel, Dict[str, Any]],
@@ -208,26 +275,15 @@ class Model(_AbstractModel):
         for k, v in data:
             key, value = k, v
 
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], Model):
+                key = f"{LIST_NESTED_MODEL_FIELD_PREFIX}{key}"
+                value = [item.__class__.__insert_on_pipeline(
+                    _id=None, pipeline=pipeline, record=item, life_span=life_span) for item in v]
+
             if isinstance(v, Model):
-                key = f"__{key}"
+                key = f"{NESTED_MODEL_FIELD_PREFIX}{key}"
                 value = v.__class__.__insert_on_pipeline(
                     _id=None, pipeline=pipeline, record=v, life_span=life_span)
 
             new_data[key] = value
         return new_data
-
-    @classmethod
-    def __get_select_fields(cls, columns: Optional[List[str]]) -> Optional[List[str]]:
-        """
-        Gets the fields to be used for selecting HMAP fields in Redis
-        It replaces any fields in `columns` that correspond to nested records with their
-        `__` suffixed versions
-        """
-        if columns is None:
-            return None
-
-        field_types = typing.get_type_hints(cls)
-        return [
-            f"__{k}" if isinstance(field_types.get(k, None), type(Model)) else k
-            for k in columns
-        ]

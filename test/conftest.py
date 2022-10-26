@@ -25,6 +25,23 @@ class Book(Model):
     in_stock: bool = True
 
 
+class File(Model):
+    _primary_key_field: str = 'name'
+    name: str
+
+
+class Folder(Model):
+    _primary_key_field: str = 'name'
+    name: str
+    files: List[File]
+
+
+folders = [
+    Folder(name="first", files=[File(name="foo.txt"), File(name="bar.txt")]),
+    Folder(name="second", files=[File(name="goo.txt"), File(name="har.txt")]),
+    Folder(name="third", files=[File(name="too.txt"), File(name="par.txt")]),
+]
+
 authors = {
     "charles": Author(name="Charles Dickens", active_years=(1220, 1280)),
     "jane": Author(name="Jane Austen", active_years=(1580, 1640)),
@@ -78,5 +95,7 @@ def redis_store(redis_server):
     )
     store.register_model(Book)
     store.register_model(Author)
+    store.register_model(File)
+    store.register_model(Folder)
     yield store
     store.redis_store.flushall()

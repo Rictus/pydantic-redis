@@ -6,7 +6,7 @@ import pytest
 
 from pydantic_redis.config import RedisConfig
 from pydantic_redis.model import Model
-from test.conftest import Book, redis_store_fixture, books, authors, Author
+from test.conftest import Book, redis_store_fixture, books, authors, Author, Folder, folders, File
 
 
 def test_redis_config_redis_url():
@@ -265,6 +265,27 @@ def test_delete_multiple(store):
             [Author(**Author.deserialize_partially(author)) for author in authors_in_redis], key=lambda x: x.name)
         expected = sorted(authors.values(), key=lambda x: x.name)
         assert expected == authors_in_redis_as_models
+
+
+@pytest.mark.parametrize("store", redis_store_fixture)
+def test_update_nested_list_of_models(store):
+    Folder.insert(folders)
+    files = File.select()
+    got = sorted(files, key=lambda x: x.name)
+    expected = [
+        File(name="bar.txt"),
+        File(name="har.txt"),
+        File(name="goo.txt"),
+        File(name="foo.txt"),
+        File(name="par.txt"),
+        File(name="too.txt"),
+    ]
+    expected.sort(key=lambda x: x.name)
+    assert expected == got
+
+    got = sorted(Folder.select(), key=lambda x: x.name)
+    expected = sorted(folders, key=lambda x: x.name)
+    assert got == expected
 
 
 def __deserialize_book_data(raw_book_data: Dict[bytes, Any]) -> Book:
